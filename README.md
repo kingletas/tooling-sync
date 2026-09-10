@@ -24,27 +24,27 @@ New to it? [`docs/from-nothing.md`](docs/from-nothing.md) walks through tracking
 
 ## Why
 
-A tool that lives in a repository and *runs* from `~/bin` has two working copies, and nothing in git relates them. Both are editable, both look authoritative, and an edit to either one is invisible from the other. There is no `git status` that spans them, no CI that sees both, and no moment at which anything says they have parted.
+A tool that lives in a repository and *runs* from `~/bin` has two working copies, and nothing in git relates them. Both are editable, both look authoritative, and an edit to either one is invisible from the other. There's no `git status` that spans them, no CI that sees both, and no moment at which anything says they have parted.
 
-The failure is not that somebody forgot to run `make install`. It is that **"in step" had no definition**, so there was nothing for a check to check.
+The failure isn't that somebody forgot to run `make install`. It's that **"in step" had no definition**, so there was nothing for a check to check.
 
 It got worse in the specific way this tool was written for. Extracting five commands into publishable repositories *generalised* them: the repository copy discovers its vault, the installed copy had one hardcoded; the repository ships a starter lane table, the installed one names eleven real repositories. So the two copies were different **on purpose**, byte-equality could never be the test, and no other test existed.
 
-Three of the five would have broken if the repository copy had simply been installed over the top, because the configuration the generalised version reads had not been written yet. Everyone involved could see that installing was wrong, and nobody could say what right looked like. A week later, edits had landed on both sides.
+Three of the five would have broken if the repository copy had simply been installed over the top, because the configuration the generalised version reads hadn't been written yet. Everyone involved could see that installing was wrong, and nobody could say what right looked like. A week later, edits had landed on both sides.
 
-## The direction is not symmetric
+## The direction isn't symmetric
 
-**The repository is the source. The prefix holds a build artefact, and the copy runs one way:** edit the repository, then install. Everything below exists to notice when that did not happen.
+**The repository is the source. The prefix holds a build artefact, and the copy runs one way:** edit the repository, then install. Everything below exists to notice when that didn't happen.
 
 So **`adopt` is a recovery path, not the other half of a pair.** It exists because an edit already made in the prefix has to go somewhere and deleting it is worse than importing it — not because editing the prefix is a thing to do. A tool that offers two directions evenly teaches that either is fine.
 
-**`install` leaves what it installed read-only**, which is where this stops being advice. A `>` redirect, a `cp` and an editor all refuse; the installers keep working, because `install(1)` unlinks the target rather than opening it. The point is timing — the gate catches an in-place edit at the next commit, and the lock catches it at the keystroke, before there is anything to rescue. `tooling-sync unlock` is one command for a deliberate experiment, and `TOOLING_LOCK=0` turns it off.
+**`install` leaves what it installed read-only**, which is where this stops being advice. A `>` redirect, a `cp` and an editor all refuse; the installers keep working, because `install(1)` unlinks the target rather than opening it. The point is timing — the gate catches an in-place edit at the next commit, and the lock catches it at the keystroke, before there's anything to rescue. `tooling-sync unlock` is one command for a deliberate experiment, and `TOOLING_LOCK=0` turns it off.
 
 Declared-local files are never locked. They are your own configuration, and hand-editing them is the one thing you're supposed to do here.
 
 ## The two ideas
 
-**The installer is the authority on what a tool owns.** `make install PREFIX=<tmpdir>` into a scratch directory produces the exact tree the tool believes it installs, and that tree is what gets compared against the real prefix. A tool that renames a file on the way in — say `bin/scanner.py` becoming `mytool.d/scanner.py` — needs no special case here, and cannot acquire one by drifting. It also means this tool has no list of what each tool installs, which is one fewer thing to keep in step.
+**The installer is the authority on what a tool owns.** `make install PREFIX=<tmpdir>` into a scratch directory produces the exact tree the tool believes it installs, and that tree is what gets compared against the real prefix. A tool that renames a file on the way in — say `bin/scanner.py` becoming `mytool.d/scanner.py` — needs no special case here, and can't acquire one by drifting. It also means this tool has no list of what each tool installs, which is one fewer thing to keep in step.
 
 **A baseline, so "which side moved" is answerable.** Two copies that differ tell you nothing about direction. Recording the hashes at the moment they last agreed turns one useless comparison into a three-way one:
 
@@ -59,7 +59,7 @@ Declared-local files are never locked. They are your own configuration, and hand
 
 With no baseline the honest answer is `unknown`, and it says that rather than guessing. **A wrong guess about direction overwrites work**, which is worse than the drift it was trying to fix.
 
-**`check` fails on four of those states, not six.** What it guards against is *loss* — `bin-ahead`, `bin-only`, `diverged` and `unknown` all mean there is a file on the disk in exactly one place, and it is the place with no history. `repo-ahead` and `uninstalled` are stale, not lost: the repository already has the work, and only the copy being run is behind. It says so and exits 0.
+**`check` fails on four of those states, not six.** What it guards against is *loss* — `bin-ahead`, `bin-only`, `diverged` and `unknown` all mean there's a file on the disk in exactly one place, and it's the place with no history. `repo-ahead` and `uninstalled` are stale, not lost: the repository already has the work, and only the copy being run is behind. It says so and exits 0.
 
 Blocking on those would mean the only way to commit a tool change is to install it first, which puts unreviewed code on `PATH` — this gate refused exactly that commit before the distinction was drawn.
 
@@ -82,24 +82,24 @@ Keep the list short. A file listed there has no gate on it.
 
 ## What it tracks
 
-Whatever `TOOLING_REPOS` lists — one repository path per line, `$HOME` expanded, `#` comments and blank lines ignored. The tool's name is the basename. **A listed path that is not on disk reads `MISSING` rather than being skipped**, because a list that quietly stops describing anything is worse than no list.
+Whatever `TOOLING_REPOS` lists — one repository path per line, `$HOME` expanded, `#` comments and blank lines ignored. The tool's name is the basename. **A listed path that isn't on disk reads `MISSING` rather than being skipped**, because a list that quietly stops describing anything is worse than no list.
 
-With no such file, set `TOOLING_ROOT` to a directory and it scans that for directories whose `Makefile` has an `install` target. That works well if you keep your tools in one place. There is no default: with neither a list nor `TOOLING_ROOT`, it stops and names the list it looked for.
+With no such file, set `TOOLING_ROOT` to a directory and it scans that for directories whose `Makefile` has an `install` target. That works well if you keep your tools in one place. There's no default: with neither a list nor `TOOLING_ROOT`, it stops and names the list it looked for.
 
-**Prefer the list once you have more than a couple.** Membership by location means a project acquires this tool's behaviour by being filed somewhere, and that is a real cost: two GTK applications had to be moved out of the scanned directory because being staged like a command breaks a desktop launcher.
+**Prefer the list once you have more than a couple.** Membership by location means a project acquires this tool's behaviour by being filed somewhere, and that's a real cost: two GTK applications had to be moved out of the scanned directory because being staged like a command breaks a desktop launcher.
 
 ## Commands
 
 | | |
 |---|---|
-| `status [TOOL...]` | one line per file that is not in step, and what to do about it |
+| `status [TOOL...]` | one line per file that isn't in step, and what to do about it |
 | `check [TOOL...]` | the same, exit 1 on drift — what a pre-commit hook calls |
 | `diff TOOL [FILE]` | the actual difference, repository on the left |
 | `install [TOOL...]` | repository → prefix, through the repository's own `make install` |
 | `adopt [TOOL...]` | prefix → repository — **recovery**, for an edit made in the wrong place |
 | `record [TOOL...]` | accept the current state as the baseline |
 | `lock` / `unlock` | make the installed copies read-only, or stop |
-| `tools` | what is tracked, and whether each has a baseline |
+| `tools` | what's tracked, and whether each has a baseline |
 
 `-n` for a dry run, `-y` to skip the prompt `adopt` raises before overwriting a repository copy that also moved.
 
@@ -108,7 +108,7 @@ With no such file, set `TOOLING_ROOT` to a directory and it scans that for direc
 | | |
 |---|---|
 | `TOOLING_REPOS` | the list of repositories, one path per line (default `~/.config/tooling-sync/repos`) |
-| `TOOLING_ROOT` | a directory to scan when there is no list (no default) |
+| `TOOLING_ROOT` | a directory to scan when there's no list (no default) |
 | `PREFIX` | where they install (default `~/bin`) |
 | `TOOLING_STATE` | baselines (default `$XDG_STATE_HOME/tooling-sync`) |
 | `TOOLING_LOCAL` | the declared-difference table |
@@ -116,7 +116,7 @@ With no such file, set `TOOLING_ROOT` to a directory and it scans that for direc
 
 ## As a gate
 
-The point is not to have a report. It is to make a commit fail. If your pre-commit hook maps a directory to the command that guards it, the two rows look like this, with `~/src/tools` standing in for wherever your tool repositories live:
+The point isn't to have a report. It's to make a commit fail. If your pre-commit hook maps a directory to the command that guards it, the two rows look like this, with `~/src/tools` standing in for wherever your tool repositories live:
 
 ```
 tooling	$HOME/src/tools	*	tooling-sync,make	tooling-sync check "$(basename "$PWD")" && make check

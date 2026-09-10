@@ -36,7 +36,7 @@ mkdir -p ~/bin
 make install
 ```
 
-The clone was run from a local copy of this repository rather than from GitHub, so that one line is not verified; the rest ran as shown.
+The clone was run from a local copy of this repository rather than from GitHub, so that one line isn't verified; the rest ran as shown.
 
 ```text
 installed tooling-sync -> /home/you/bin
