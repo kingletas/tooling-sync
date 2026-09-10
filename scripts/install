@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# install -- put tooling-sync on your PATH.
+#
+# Usage:
+#   scripts/install [PREFIX]     default: ~/bin
+#
+# Called by `make install`. One file, no payload directory -- so unlike its
+# siblings this install has nothing to get half-done. The verification below is
+# still worth its two lines: `tools` reads the repository root and the prefix,
+# which is the only thing that can be wrong about a fresh install.
+
+set -euo pipefail
+usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+[[ "${1:-}" =~ ^(-h|--help)$ ]] && { usage; exit 0; }
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+prefix="${1:-$HOME/bin}"
+[[ -d "$prefix" ]] || { echo "install: no such directory: $prefix" >&2; exit 2; }
+
+install -m 755 "$here/bin/tooling-sync" "$prefix/tooling-sync"
+echo "installed tooling-sync -> $prefix"
+case ":$PATH:" in *":$prefix:"*) ;; *) echo "note: $prefix is not on your PATH" >&2 ;; esac
+
+# A first install has nothing to track yet, so it says what to write rather than failing.
+list="${TOOLING_REPOS:-$HOME/.config/tooling-sync/repos}"
+if [[ ! -f "$list" && -z "${TOOLING_ROOT:-}" ]]; then
+  echo "next: list your tool repositories in $list, one path per line"
+  exit 0
+fi
+
+# `tools` rather than `--help`: a help screen prints from a copy that cannot
+# find anything. This one has to resolve the repository root to say a word.
+PREFIX="$prefix" "$prefix/tooling-sync" tools >/dev/null \
+  || { echo "install: the installed copy cannot read the tool repositories" >&2; exit 1; }
+echo "tool repositories reachable from the installed copy"

@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+#
+# tooling-sync -- keep an installed command and the repository it came from in step.
+#
+# Usage:
+#   tooling-sync status  [TOOL...]      what each tracked file's state is
+#   tooling-sync check   [TOOL...]      exit 1 on any drift; what a gate calls
+#   tooling-sync diff    TOOL [FILE]    the actual difference, repo vs installed
+#   tooling-sync install [TOOL...]      repository -> prefix, via the repo's own `make install`
+#   tooling-sync adopt   [TOOL...]      prefix -> repository -- RECOVERY, not a workflow
+#   tooling-sync lock    [TOOL...]      make the installed copies read-only
+#   tooling-sync unlock  [TOOL...]      undo that, for a deliberate experiment
+#   tooling-sync record  [TOOL...]      accept the current state as the baseline
+#   tooling-sync tools                  the repositories being tracked
+#
+# Flags:
+#   -n   dry run: say what would be copied, copy nothing
+#   -y   do not prompt (adopt and install are otherwise interactive)
+#   -h   this header
+#
+# Environment overrides:
+#   TOOLING_REPOS  the list of tool repositories, one path per line
+#                                           (default: ~/.config/tooling-sync/repos)
+#   TOOLING_ROOT   a directory to scan instead, when there is no list
+#                                           (no default: set it to use the scan)
+#   PREFIX         where they install       (default: ~/bin)
+#   TOOLING_STATE  baseline manifests       (default: $XDG_STATE_HOME/tooling-sync)
+#   TOOLING_LOCAL  local-override table     (default: ~/.config/tooling-sync/local.tsv)
+#   TOOLING_ELSEWHERE  tools installed outside the prefix
+#                                           (default: ~/.config/tooling-sync/elsewhere.tsv)
+#   TOOLING_LOCK   0 to stop `install` making the installed copies read-only
+#
+# --- why this exists ---------------------------------------------------------
+#
+# A tool that lives in a repository and RUNS from ~/bin has two working copies,
+# and nothing in git relates them. Both are editable, both look authoritative,
+# and an edit to either one is invisible from the other. The failure is not that
+# somebody forgot to install -- it is that "in step" had no definition, so there
+# was nothing for a check to check.
+#
+# The trap that made it worse here: extracting these tools into publishable
+# repositories deliberately GENERALISED them. The repository copy of a tool
+# discovers its vault; the installed copy had one hardcoded. So the two copies
+# were never byte-identical by design, byte-equality could not be the test, and
+# no other test existed. Three of five tools would have BROKEN if the repository
+# copy had simply been installed over the top, because the configuration the
+# generalised version reads had not been written yet.
+#
+# --- the direction is not symmetric ------------------------------------------
+#
+# The repository is the source. The prefix holds a BUILD ARTEFACT, and the copy
+# runs one way: edit the repository, then install. That is the process, and the
+# rest of this tool exists to notice when it was not followed.
+#
+# So `adopt` is a RECOVERY path, not the other half of a pair. It exists because
+# an edit already made in the prefix has to go somewhere, and deleting it is
+# worse than importing it -- not because editing the prefix is a thing to do.
+# Every message here says so, because a tool that offers two directions evenly
+# teaches that either is fine.
+#
+# `install` makes what it installed read-only, which is where this stops being
+# advice. A `>` redirect, a `cp`, and an editor all refuse; the installers keep
+# working, because `install(1)` unlinks the target rather than opening it. The
+# point is the timing -- the wrong path fails at the moment of the mistake,
+# rather than at a commit a hundred lines later. `unlock` is one command, for a
+# deliberate experiment, and `TOOLING_LOCK=0` turns it off entirely.
+#
+# --- the two ideas that make this decidable ----------------------------------
+#
+# 1. The installer is the authority on what a tool installs, not this script.
+#    `make install PREFIX=<tmpdir>` into a scratch directory produces the exact
+#    tree the tool believes it owns, and that tree is compared against the real
+#    prefix. So a tool that renames a file on the way in (credential-guard puts
+#    bin/check_credentials.py into credential-guard.d/) needs no special case
+#    here, and cannot acquire one by drifting.
+#
+# 2. A baseline, so "which side moved" is answerable. Two copies that differ
+#    tell you nothing about direction. Recording the hashes at the moment they
+#    last agreed turns one useless comparison into a three-way one:
+#
+#      installed == baseline, repo moved  -> repo-ahead, run `install`
+#      repo == baseline, installed moved  -> bin-ahead,  run `adopt`
+#      both moved, and differ             -> diverged,   read the `diff`
+#
+#    With no baseline the honest answer is `unknown`, and this says that rather
+#    than guessing a direction. A wrong guess overwrites work.
+#
+# Some differences are correct and permanent -- an installed lane table naming
+# this estate's repositories, against a repository shipping a generic starter.
+# Those are declared in TOOLING_LOCAL and reported as `local`. Declared, so the
+# exception is visible; a silent exception is how the drift started.
+#
+# A tool can also be installed somewhere else entirely -- a Debian package in
+# /usr/bin, a flatpak -- in which case the prefix is EMPTY on purpose and
+# `uninstalled` is the wrong word for it. Those are declared in
+# TOOLING_ELSEWHERE and reported as `elsewhere`. The declaration names the
+# path and is CHECKED: if nothing is there, this says so rather than taking
+# the claim on trust. A declaration nothing verifies is a way to silence a
+# tool that really has gone missing.
+#
+# A copy turning up in the prefix for a tool declared elsewhere is `shadowing`
+# and fails a check. Two installs racing each other on PATH is what this tool
+# exists to notice, and this one hides best: a prefix copy built from the same
+# source hashes equal to it and would otherwise read as `synced`.
+
+set -uo pipefail   # not -e: status and check must survive one bad repository
+                   # and still report on the rest. Failures are tallied by hand.
+
+TOOLING_REPOS="${TOOLING_REPOS:-$HOME/.config/tooling-sync/repos}"
+TOOLING_ROOT="${TOOLING_ROOT:-}"
+PREFIX="${PREFIX:-$HOME/bin}"
+TOOLING_STATE="${TOOLING_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/tooling-sync}"
+TOOLING_LOCAL="${TOOLING_LOCAL:-$HOME/.config/tooling-sync/local.tsv}"
+TOOLING_ELSEWHERE="${TOOLING_ELSEWHERE:-$HOME/.config/tooling-sync/elsewhere.tsv}"
+
+DRY=0
+ASSUME_YES=0
+
+usage() { sed -n '2,/^# --- why/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
+die()   { printf 'tooling-sync: %s\n' "$*" >&2; exit 2; }
+note()  { printf '%s\n' "$*" >&2; }
+
+# Colour only when a human is looking. A gate's output lands in a log.
+if [[ -t 1 ]]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=''; C_WARN=''; C_BAD=''; C_DIM=''; C_OFF=''
+fi
+
+hash_of() { [[ -f "$1" ]] && sha256sum "$1" 2>/dev/null | cut -d' ' -f1 || echo '-'; }
+
+# --- the tracked set ---------------------------------------------------------
+
+# WHICH REPOSITORIES ARE TOOLS IS DECLARED, NOT INFERRED FROM WHERE THEY SIT.
+# TOOLING_REPOS names a file holding one repository path per line; the tool's
+# name is the basename. $HOME is expanded, so the file reads the same as
+# contract-gate.d/repos and can be edited the same way.
+#
+# Membership is never inferred from a shared parent directory: that would stage
+# any project filed there as a tool, and staging breaks an app that installs a
+# desktop launcher. A project should not acquire behaviour by being filed
+# somewhere.
+#
+# The scan is kept as the fallback for anyone with no list, because keeping
+# your tools in one directory is a perfectly good default for someone who is
+# not this estate. Here the list is the authority.
+list_tools() {
+  local line path
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" ]] || continue
+    path="${line/#\$HOME/$HOME}"
+    printf '%s\t%s\n' "$(basename "$path")" "$path"
+  done < "$TOOLING_REPOS"
+}
+
+scan_tools() {
+  local d
+  for d in "$TOOLING_ROOT"/*/; do
+    [[ -f "$d/Makefile" ]] || continue
+    grep -qE '^install:' "$d/Makefile" || continue
+    printf '%s\t%s\n' "$(basename "$d")" "${d%/}"
+  done
+}
+
+tools_table() {
+  if [[ -f "$TOOLING_REPOS" ]]; then list_tools
+  elif [[ -n "$TOOLING_ROOT" ]]; then scan_tools
+  fi
+}
+
+all_tools() { tools_table | cut -f1; }
+
+# A listed repository that is not on disk is REPORTED, never skipped. Skipping
+# is how a list stops describing anything without saying so: move all nine
+# repositories and a scan-and-skip reports every one of them as fine by not
+# mentioning them at all.
+tool_repo() {
+  local want="$1" name path
+  while IFS=$'\t' read -r name path; do
+    [[ "$name" == "$want" ]] && { printf '%s' "$path"; return 0; }
+  done < <(tools_table)
+  [[ -n "$TOOLING_ROOT" ]] && printf '%s/%s' "$TOOLING_ROOT" "$want"
+  return 0
+}
+
+resolve_tools() {
+  if [[ $# -eq 0 ]]; then all_tools; return; fi
+  local t
+  for t in "$@"; do
+    [[ -d "$(tool_repo "$t")" ]] || die "no such tool repository: $t (looked in $(source_of_truth))"
+    printf '%s\n' "$t"
+  done
+}
+
+source_of_truth() {
+  if [[ -f "$TOOLING_REPOS" ]]; then printf '%s' "$TOOLING_REPOS"; else printf '%s' "$TOOLING_ROOT"; fi
+}
+
+# --- local overrides ---------------------------------------------------------
+
+# Lines are `tool <TAB> glob <TAB> reason`. The reason is required and printed:
+# an undocumented exception is indistinguishable from the drift this catches.
+is_local() {
+  local tool="$1" rel="$2" t g
+  [[ -f "$TOOLING_LOCAL" ]] || return 1
+  while IFS=$'\t' read -r t g _; do
+    [[ -z "${t:-}" || "$t" == \#* ]] && continue
+    [[ "$t" == "$tool" || "$t" == '*' ]] || continue
+    # shellcheck disable=SC2053  # a glob on the right is the point
+    [[ "$rel" == $g ]] && return 0
+  done < "$TOOLING_LOCAL"
+  return 1
+}
+
+# Lines are `tool <TAB> path <TAB> reason`. The path is where the tool actually
+# lives now, and it is checked rather than believed.
+elsewhere_path() {
+  local tool="$1" t w
+  [[ -f "$TOOLING_ELSEWHERE" ]] || return 1
+  while IFS=$'\t' read -r t w _; do
+    [[ -z "${t:-}" || "$t" == \#* ]] && continue
+    [[ "$t" == "$tool" ]] || continue
+    printf '%s' "${w/#\~/$HOME}"
+    return 0
+  done < "$TOOLING_ELSEWHERE"
+  return 1
+}
+
+elsewhere_reason() {
+  local tool="$1" t r
+  [[ -f "$TOOLING_ELSEWHERE" ]] || return 1
+  while IFS=$'\t' read -r t _ r; do
+    [[ -z "${t:-}" || "$t" == \#* ]] && continue
+    [[ "$t" == "$tool" ]] || continue
+    printf '%s' "${r:-undeclared}"
+    return 0
+  done < "$TOOLING_ELSEWHERE"
+  return 1
+}
+
+local_reason() {
+  local tool="$1" rel="$2" t g r
+  [[ -f "$TOOLING_LOCAL" ]] || return 1
+  while IFS=$'\t' read -r t g r; do
+    [[ -z "${t:-}" || "$t" == \#* ]] && continue
+    [[ "$t" == "$tool" || "$t" == '*' ]] || continue
+    # shellcheck disable=SC2053
+    [[ "$rel" == $g ]] && { printf '%s' "${r:-undeclared}"; return 0; }
+  done < "$TOOLING_LOCAL"
+  return 1
+}
+
+# --- the expected tree -------------------------------------------------------
+
+# Run the repository's own installer into a scratch prefix. Everything this
+# script knows about what a tool owns comes from here, so a tool cannot drift
+# away from its own description of itself.
+EXPECTED_DIR=''
+build_expected() {
+  local tool="$1" repo out log
+  repo="$(tool_repo "$tool")"
+  out="$(mktemp -d "${TMPDIR:-/tmp}/tooling-sync.XXXXXX")" || return 1
+  log="$out.log"
+  # PREFIX is passed explicitly rather than exported: a Makefile using ?= would
+  # otherwise inherit the real prefix from the environment and install for real.
+  if ! make -C "$repo" install PREFIX="$out" >"$log" 2>&1; then
+    note "${C_BAD}$tool${C_OFF}: \`make install\` into a scratch prefix failed — cannot tell what it owns"
+    tail -15 "$log" | sed 's/^/    /' >&2
+    rm -rf "$out" "$log"
+    return 1
+  fi
+  rm -f "$log"
+  EXPECTED_DIR="$out"
+  return 0
+}
+
+# --- baseline ----------------------------------------------------------------
+
+baseline_file() { printf '%s/%s.tsv' "$TOOLING_STATE" "$1"; }
+
+baseline_hash() {
+  local tool="$1" rel="$2" f h r
+  f="$(baseline_file "$tool")"
+  [[ -f "$f" ]] || { echo '-'; return; }
+  while IFS=$'\t' read -r h r; do
+    [[ "$r" == "$rel" ]] && { printf '%s' "$h"; return; }
+  done < "$f"
+  echo '-'
+}
+
+# Record what is installed NOW as the point the two copies agreed.
+write_baseline() {
+  local tool="$1" rel
+  mkdir -p "$TOOLING_STATE"
+  local f; f="$(baseline_file "$tool")"
+  : > "$f"
+  while read -r rel; do
+    printf '%s\t%s\n' "$(hash_of "$PREFIX/$rel")" "$rel" >> "$f"
+  done < <(tracked_rels "$tool")
+}
+
+# --- locking -----------------------------------------------------------------
+
+# Managed files are installed read-only so the wrong edit fails where it is
+# made. Declared-local files are NOT locked: they are the estate's own
+# configuration, hand-edited on purpose, and locking them would be telling
+# somebody off for the one thing they are supposed to do here.
+#
+# Modes are not compared anywhere -- `state_of` reads content hashes -- so a
+# locked 555 file and a 755 file in a repository are `synced`, which is correct.
+set_lock() {
+  local tool="$1" want="$2" rel path n=0
+  while read -r rel; do
+    is_local "$tool" "$rel" && continue
+    path="$PREFIX/$rel"
+    [[ -f "$path" ]] || continue
+    if [[ "$want" == lock ]]; then chmod a-w "$path" 2>/dev/null && n=$((n + 1))
+    else chmod u+w "$path" 2>/dev/null && n=$((n + 1)); fi
+  done < <(tracked_rels "$tool")
+  printf '%s' "$n"
+}
+
+# --- comparison --------------------------------------------------------------
+
+# Every file the expected tree holds, plus every file sitting in a directory the
+# tool owns that the expected tree does NOT hold. The second half is what caught
+# gate-bin-python: a helper written straight into ~/bin, present nowhere in the
+# repository, and invisible to any check that only walks the repository.
+# Bytecode and linter caches are produced by RUNNING a tool, not by installing
+# it -- an installer that verifies itself leaves them in the scratch prefix, and
+# real use leaves them in the real one. They are never evidence of drift.
+CACHE_RE='(^|/)(__pycache__|\.ruff_cache|\.mypy_cache|\.pytest_cache)/'
+
+tracked_rels() {
+  local tool="$1" rel top
+  [[ -n "$EXPECTED_DIR" ]] || return 0
+  (cd "$EXPECTED_DIR" && find . -type f -printf '%P\n' | grep -vE "$CACHE_RE" | sort)
+  for top in "$EXPECTED_DIR"/*; do
+    [[ -d "$top" ]] || continue
+    top="$(basename "$top")"
+    [[ -d "$PREFIX/$top" ]] || continue
+    (cd "$PREFIX/$top" && find . -type f -printf "$top/%P\n" 2>/dev/null) \
+      | grep -vE "$CACHE_RE" \
+      | while read -r rel; do [[ -f "$EXPECTED_DIR/$rel" ]] || printf '%s\n' "$rel"; done
+  done
+}
+
+state_of() {
+  local tool="$1" rel="$2" eh ih bh where
+  if is_local "$tool" "$rel"; then echo local; return; fi
+  eh="$(hash_of "$EXPECTED_DIR/$rel")"
+  ih="$(hash_of "$PREFIX/$rel")"
+    # Declared as living somewhere else. The declaration names a path, so it is
+    # checked: a claim nothing verifies would silence a tool that really has gone.
+    #
+    # A copy in the prefix is the case worth catching. It shadows the declared
+    # install on PATH, and when it happens to match the source it hashes equal
+    # and reads as `synced` -- green, while the command being run is not the one
+    # anybody thinks is installed.
+    if where="$(elsewhere_path "$tool")"; then
+      # Only the entry point can shadow: it is the name on PATH. A tool's other
+      # files are payload, and the declaration is keyed by tool rather than by
+      # file, so applying this to all of them would flag payload that belongs.
+      [[ "$ih" != '-' && "$rel" == "$tool" ]] && { echo shadowing; return; }
+      [[ -e "$where" ]] && { echo elsewhere; return; }
+      echo elsewhere-gone; return
+    fi
+  [[ "$eh" == "$ih" ]] && { echo synced;      return; }
+  [[ "$ih" == '-'  ]] && { echo uninstalled;  return; }
+  [[ "$eh" == '-'  ]] && { echo bin-only;     return; }
+  bh="$(baseline_hash "$tool" "$rel")"
+  [[ "$bh" == '-'  ]] && { echo unknown;      return; }
+  [[ "$ih" == "$bh" ]] && { echo repo-ahead;  return; }
+  [[ "$eh" == "$bh" ]] && { echo bin-ahead;   return; }
+  echo diverged
+}
+
+state_colour() {
+  case "$1" in
+    synced|local|elsewhere)      echo "$C_OK" ;;
+    repo-ahead|bin-ahead|uninstalled|bin-only) echo "$C_WARN" ;;
+    *)                           echo "$C_BAD" ;;
+  esac
+}
+
+state_advice() {
+  case "$1" in
+    repo-ahead)  echo "tooling-sync install — the prefix is behind the source" ;;
+    uninstalled) echo "tooling-sync install" ;;
+    elsewhere)   echo "" ;;
+    elsewhere-gone) echo "declared as installed elsewhere, and it is not there" ;;
+      shadowing)   echo "a copy in the prefix is shadowing the declared install — remove it" ;;
+    # These three all mean the same thing happened: the artefact was edited
+    # instead of the source. Say that, rather than offering `adopt` as though it
+    # were the other half of a pair.
+    bin-ahead)   echo "edited in place — adopt to rescue it, then install" ;;
+    bin-only)    echo "written straight into the prefix — adopt to rescue it" ;;
+    diverged)    echo "edited in place AND in the source — tooling-sync diff" ;;
+    unknown)     echo "tooling-sync diff    — no baseline, direction unknown" ;;
+    *)           echo "" ;;
+  esac
+}
+
+# --- the repository's own source for an installed file -----------------------
+
+# Reverse the installer's mapping so `adopt` knows where to put a file back.
+# `bin/<rel>` first, then a unique basename match under bin/ -- which is what
+# resolves a rename like check_credentials.py without naming the tool here.
+repo_source_for() {
+  local tool="$1" rel="$2" repo hits
+  repo="$(tool_repo "$tool")"
+  [[ -f "$repo/bin/$rel" ]] && { printf '%s/bin/%s' "$repo" "$rel"; return 0; }
+  mapfile -t hits < <(find "$repo/bin" -type f -name "$(basename "$rel")" 2>/dev/null)
+  [[ ${#hits[@]} -eq 1 ]] && { printf '%s' "${hits[0]}"; return 0; }
+  return 1
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_tools() {
+  local t repo state
+  printf '%-18s %-46s %s\n' TOOL REPOSITORY BASELINE
+  while read -r t; do
+    repo="$(tool_repo "$t")"
+    if [[ -d "$repo" ]]; then
+      state="$([[ -f "$(baseline_file "$t")" ]] && echo recorded || echo "${C_WARN}none${C_OFF}")"
+    else
+      state="${C_BAD}MISSING${C_OFF}"
+    fi
+    printf '%-18s %-46s %s\n' "$t" "${repo/#$HOME/\~}" "$state"
+  done < <(all_tools)
+  printf '\nlisted in: %s\n' "$(source_of_truth)"
+  printf 'prefix:    %s\n' "${PREFIX/#$HOME/\~}"
+}
+
+cmd_status() {
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t rel st hint drift=0 total=0 shown
+  for t in "${tools[@]}"; do
+    build_expected "$t" || { drift=$((drift + 1)); continue; }
+    shown=0
+    while read -r rel; do
+      total=$((total + 1))
+      st="$(state_of "$t" "$rel")"
+      case "$st" in synced) continue ;; esac
+      [[ $shown -eq 0 ]] && { printf '\n%s\n' "$t"; shown=1; }
+      if [[ "$st" == local ]]; then hint="$(local_reason "$t" "$rel")"; else hint="$(state_advice "$st")"; fi
+      printf '  %s%-12s%s %-40s %s%s%s\n' \
+        "$(state_colour "$st")" "$st" "$C_OFF" "$rel" "$C_DIM" "$hint" "$C_OFF"
+      [[ "$st" == local ]] || drift=$((drift + 1))
+    done < <(tracked_rels "$t")
+    [[ $shown -eq 0 ]] && printf '\n%s\n  %sin step%s\n' "$t" "$C_OK" "$C_OFF"
+    rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+  done
+  printf '\n%d file(s) tracked, %s%d out of step%s\n' \
+    "$total" "$([[ $drift -eq 0 ]] && echo "$C_OK" || echo "$C_BAD")" "$drift" "$C_OFF"
+  return $(( drift > 0 ))
+}
+
+# Not every drift is worth refusing a commit over, and getting that wrong makes
+# the gate an obstacle rather than a guard.
+#
+# What this protects against is LOSS: the prefix holding work that git does not
+# have. `bin-ahead`, `bin-only`, `diverged` and `unknown` are all that shape --
+# there is a file on this disk in exactly one place, and it is the place with no
+# history.
+#
+# `repo-ahead` and `uninstalled` are not. The repository already has the work;
+# what is stale is the copy being RUN. That is worth saying and not worth
+# blocking on, and blocking on it is actively wrong: it makes committing a tool
+# change require installing it first, so the only way to commit is to put
+# unreviewed code on PATH. This gate refused exactly that commit before the
+# distinction was drawn.
+loses_work() {
+  case "$1" in bin-ahead|bin-only|diverged|unknown) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_check() {
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t rel st risky=0 stale=0 shadowed=0
+  C_OK=''; C_WARN=''; C_BAD=''; C_DIM=''; C_OFF=''
+  local -a risky_lines=() stale_lines=() shadowed_lines=()
+  for t in "${tools[@]}"; do
+    build_expected "$t" || { risky=$((risky + 1)); risky_lines+=("$t: cannot determine what it installs"); continue; }
+    while read -r rel; do
+      st="$(state_of "$t" "$rel")"
+      case "$st" in synced|local|elsewhere) continue ;; esac
+      # Shadowing loses no work, so it is not `risky` -- and `install` is the
+      # one thing that must not be offered for it, so it is not `stale` either.
+      if [[ "$st" == shadowing ]]; then
+        shadowed=$((shadowed + 1)); shadowed_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
+      elif loses_work "$st"; then
+        risky=$((risky + 1)); risky_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
+      else
+        stale=$((stale + 1)); stale_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
+      fi
+    done < <(tracked_rels "$t")
+    rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+  done
+
+  if [[ $stale -gt 0 ]]; then
+    printf 'tooling-sync: %d file(s) are newer in their repository than on PATH.\n' "$stale"
+    printf '%s\n' "${stale_lines[@]}"
+    printf 'Run "tooling-sync install" when you want to be running them.\n\n'
+  fi
+    if [[ $shadowed -gt 0 ]]; then
+      printf 'tooling-sync: %d file(s) in the prefix are shadowing an install declared elsewhere.\n' "$shadowed"
+      printf '%s\n' "${shadowed_lines[@]}"
+      printf '\nThe prefix comes first on PATH, so this copy is what runs -- not the one\n'
+      printf 'the declaration names, and not the one anybody thinks is installed.\n'
+      printf 'Remove the prefix copy. Do not run "tooling-sync install": it is what\n'
+      printf 'puts the copy there.\n\n'
+    fi
+  if [[ $risky -gt 0 ]]; then
+    printf 'tooling-sync: %d file(s) were edited in the prefix rather than in the source.\n' "$risky"
+    printf '%s\n' "${risky_lines[@]}"
+    printf '\nThe repository is the source; the prefix holds a build artefact. This work\n'
+    printf 'exists on the disk in one place and that place has no history.\n'
+    printf '"tooling-sync diff" shows it, "tooling-sync adopt" rescues it into the\n'
+    printf 'repository -- then commit there and "tooling-sync install" back out.\n'
+    return 1
+  fi
+    [[ $shadowed -gt 0 ]] && return 1
+  return 0
+}
+
+cmd_diff() {
+  local tool="${1:-}" only="${2:-}"
+  [[ -n "$tool" ]] || die "diff needs a tool name"
+  resolve_tools "$tool" >/dev/null || exit 2
+  build_expected "$tool" || exit 1
+  local rel st
+  while read -r rel; do
+    [[ -n "$only" && "$rel" != *"$only"* ]] && continue
+    st="$(state_of "$tool" "$rel")"
+    [[ "$st" == synced ]] && continue
+    printf '\n=== %s  [%s]\n' "$rel" "$st"
+    # Left is the repository, right is what is installed, always in that order.
+    diff -u --label "repo:$rel" --label "installed:$rel" \
+      "$EXPECTED_DIR/$rel" "$PREFIX/$rel" 2>/dev/null || true
+  done < <(tracked_rels "$tool")
+  rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+}
+
+confirm() {
+  [[ $ASSUME_YES -eq 1 ]] && return 0
+  local reply
+  read -r -p "$1 [y/N] " reply
+  [[ "$reply" == [yY]* ]]
+}
+
+cmd_install() {
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t repo failed=0 where
+  for t in "${tools[@]}"; do
+    # A tool declared as living elsewhere is not installed into the prefix.
+    # Doing it anyway would put a second copy on PATH ahead of the real one and
+    # recreate exactly the shadowing the declaration exists to record.
+    if where="$(elsewhere_path "$t")"; then
+      printf '\n%s\n  %-12s %s\n' "$t" "skipped" "installed elsewhere: ${where/#$HOME/\~}"
+      continue
+    fi
+    if [[ $DRY -eq 1 ]]; then
+      repo="$(tool_repo "$t")"
+      printf 'would run: make -C %s install PREFIX=%s\n' "${repo/#$HOME/\~}" "${PREFIX/#$HOME/\~}"
+      continue
+    fi
+    printf '\n%s\n' "$t"
+    # A declared-local file has to survive its own installer. The installer
+    # cannot know about the declaration -- it is estate configuration and the
+    # tool is generic -- so the file is carried around the install rather than
+    # excluded from it. Skipping this is how an install silently replaces a lane
+    # table naming eleven repositories with a shipped starter naming none.
+    local -a kept=(); local rel keep
+    keep="$(mktemp -d "${TMPDIR:-/tmp}/tooling-sync-keep.XXXXXX")"
+    if build_expected "$t"; then
+      while read -r rel; do
+        is_local "$t" "$rel" || continue
+        [[ -f "$PREFIX/$rel" ]] || continue
+        mkdir -p "$keep/$(dirname "$rel")"
+        cp -p "$PREFIX/$rel" "$keep/$rel"
+        kept+=("$rel")
+      done < <(tracked_rels "$t")
+      rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+    fi
+
+    if ! make -C "$(tool_repo "$t")" install PREFIX="$PREFIX" 2>&1 | sed 's/^/  /'; then
+      rm -rf "$keep"; failed=$((failed + 1)); continue
+    fi
+
+    for rel in ${kept+"${kept[@]}"}; do
+      cp -p "$keep/$rel" "$PREFIX/$rel"
+      printf '  kept local %s\n' "$rel"
+    done
+    rm -rf "$keep"
+    if build_expected "$t"; then
+      [[ "${TOOLING_LOCK:-1}" == 0 ]] || printf '  locked %s file(s) read-only\n' "$(set_lock "$t" lock)"
+      write_baseline "$t"
+      rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+      printf '  baseline recorded\n'
+    fi
+  done
+  return $(( failed > 0 ))
+}
+
+cmd_adopt() {
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t rel st src copied=0 stuck=0
+  for t in "${tools[@]}"; do
+    build_expected "$t" || { stuck=$((stuck + 1)); continue; }
+    while read -r rel; do
+      st="$(state_of "$t" "$rel")"
+      case "$st" in bin-ahead|bin-only|diverged|unknown) ;; *) continue ;; esac
+      if ! src="$(repo_source_for "$t" "$rel")"; then
+        # No counterpart in the repository. Mirroring the installed layout is a
+        # guess, so it is offered rather than done, and named as a guess.
+        src="$(tool_repo "$t")/bin/$rel"
+        note "  ${C_WARN}$rel${C_OFF}: no counterpart in the repository; ${C_DIM}bin/$rel is a guess at where it belongs${C_OFF}"
+      fi
+      if [[ "$st" == diverged || "$st" == unknown ]]; then
+        printf '  %s is %s — the repository copy has changes too.\n' "$rel" "$st"
+        confirm "  overwrite the repository copy with the installed one?" || { stuck=$((stuck + 1)); continue; }
+      fi
+      if [[ $DRY -eq 1 ]]; then
+        printf '  would copy %s -> %s\n' "$PREFIX/$rel" "${src/#$HOME/\~}"; continue
+      fi
+      mkdir -p "$(dirname "$src")"
+      # Read the locked file and write an unlocked one: the repository is a
+      # working tree, and nothing there should arrive read-only.
+      if install -m 644 "$PREFIX/$rel" "$src" 2>/dev/null; then
+        [[ -x "$PREFIX/$rel" ]] && chmod 755 "$src"
+        printf '  adopted %s\n' "$rel"; copied=$((copied + 1))
+      fi
+    done < <(tracked_rels "$t")
+    rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+  done
+  if [[ $DRY -eq 0 && $copied -gt 0 ]]; then
+    printf '\n%d file(s) adopted into the repositories. They are now DIRTY and uncommitted —\n' "$copied"
+    printf 'commit them, then run "tooling-sync install" so the prefix comes back from\n'
+    printf 'the source rather than being left as the thing that was edited.\n\n'
+    printf 'Adopting is recovery. The process is: edit the repository, then install.\n'
+  fi
+  return $(( stuck > 0 ))
+}
+
+cmd_lock() {
+  local want="$1"; shift
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t
+  for t in "${tools[@]}"; do
+    build_expected "$t" || continue
+    if [[ $DRY -eq 1 ]]; then printf 'would %s %s\n' "$want" "$t"
+    else printf '%-18s %s file(s) %sed\n' "$t" "$(set_lock "$t" "$want")" "$want"; fi
+    rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+  done
+  [[ "$want" == unlock ]] && printf '\nThese are build artefacts. Edit the repository and install; unlocking is for\nreading and experimenting, not for making a change that has to last.\n'
+  return 0
+}
+
+cmd_record() {
+  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  local t
+  for t in "${tools[@]}"; do
+    build_expected "$t" || continue
+    if [[ $DRY -eq 1 ]]; then printf 'would record baseline for %s\n' "$t"
+    else write_baseline "$t"; printf 'recorded %s (%s)\n' "$t" "$(baseline_file "$t")"; fi
+    rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
+  done
+}
+
+# --- entry point -------------------------------------------------------------
+
+main() {
+  local -a rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -n) DRY=1 ;;
+      -y) ASSUME_YES=1 ;;
+      --) shift; rest+=("$@"); break ;;
+      *)  rest+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#rest[@]} -gt 0 ]] || { usage; exit 0; }
+
+  if [[ ! -f "$TOOLING_REPOS" ]]; then
+    [[ -n "$TOOLING_ROOT" ]] \
+      || die "no repository list at $TOOLING_REPOS: write one path per line there, or set TOOLING_ROOT to a directory to scan"
+    [[ -d "$TOOLING_ROOT" ]] \
+      || die "no repository list at $TOOLING_REPOS and nothing to scan at $TOOLING_ROOT"
+  fi
+  [[ -d "$PREFIX" ]]       || die "no such prefix: $PREFIX"
+
+  local cmd="${rest[0]}"; rest=("${rest[@]:1}")
+  case "$cmd" in
+    status)  cmd_status  "${rest[@]}" ;;
+    check)   cmd_check   "${rest[@]}" ;;
+    diff)    cmd_diff    "${rest[@]}" ;;
+    install) cmd_install "${rest[@]}" ;;
+    adopt)   cmd_adopt   "${rest[@]}" ;;
+    record)  cmd_record  "${rest[@]}" ;;
+    lock)    cmd_lock lock   "${rest[@]}" ;;
+    unlock)  cmd_lock unlock "${rest[@]}" ;;
+    tools)   cmd_tools ;;
+    *)       die "unknown command: $cmd (try -h)" ;;
+  esac
+}
+
+main "$@"

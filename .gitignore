@@ -1,0 +1,8 @@
+# A user-level excludes file can ignore *.sh, which would drop tests/run.sh from the repository.
+!*.sh
+
+__pycache__/
+*.pyc
+
+# Disposable output: build products, screenshots, scratch notes. Never committed.
+local.d/

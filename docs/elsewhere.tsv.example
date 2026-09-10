@@ -1,0 +1,22 @@
+# Tools installed somewhere other than the prefix, on purpose.
+#
+# tool <TAB> where it is now <TAB> why
+#
+# The prefix being empty for one of these is the intended state, so it is
+# reported as `elsewhere` rather than `uninstalled`, and `install` leaves it
+# alone. Installing it anyway would put a second copy on PATH ahead of the real
+# one and recreate the shadowing this exists to record.
+#
+# The path is CHECKED rather than believed. If nothing is there the state is
+# `elsewhere-gone`, because a declaration nothing verifies is a way to silence
+# a tool that really has disappeared.
+#
+# A copy turning up in the prefix anyway is still reported normally. Two
+# installs racing each other on PATH is the thing this tool exists to notice.
+#
+# Like local.tsv, keep this in ~/bin and reach it through a symlink at
+# ~/.config/tooling-sync/elsewhere.tsv: ~/.config has no git history and is in
+# no backup set, so a declaration kept only there has no record of when it was
+# made or why.
+#
+# ordane	/usr/bin/ordane	installed from its own .deb; ~/bin would shadow it
