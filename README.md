@@ -103,6 +103,8 @@ With no such file, set `TOOLING_ROOT` to a directory and it scans that for direc
 
 `-n` for a dry run, `-y` to skip the prompt `adopt` raises before overwriting a repository copy that also moved.
 
+**`TOOL` is a tracked repository's name, or a directory inside one.** `.`, or anything with a slash in it, names the tool whose repository that directory belongs to, whether it's the repository itself or a worktree of it. A name or a directory that is no tracked tool ends the command with exit 2, and nothing is done for the names beside it.
+
 ## Environment
 
 | | |
@@ -119,9 +121,11 @@ With no such file, set `TOOLING_ROOT` to a directory and it scans that for direc
 The point isn't to have a report. It's to make a commit fail. If your pre-commit hook maps a directory to the command that guards it, the two rows look like this, with `~/src/tools` standing in for wherever your tool repositories live:
 
 ```
-tooling	$HOME/src/tools	*	tooling-sync,make	tooling-sync check "$(basename "$PWD")" && make check
+tooling	$HOME/src/tools	*	tooling-sync,make	tooling-sync check . && make check
 tooling-bin	$HOME/bin	*	tooling-sync	tooling-sync check
 ```
+
+**The first row says `.` and not the folder's name.** A hook runs in whichever checkout the commit is made from, and a worktree's folder isn't named after the tool. `.` names the tool that checkout belongs to.
 
 A full check across six tools costs under a second, because an install is a handful of file copies.
 

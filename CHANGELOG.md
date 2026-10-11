@@ -12,6 +12,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- **A tool can be named by a directory.** `.`, or anything with a slash in it, names the tool whose repository that directory is inside, whether it's the repository itself or a worktree of it. A gate can then call `tooling-sync check .` from whichever checkout a commit is made in.
 - **A tool can be declared as installed somewhere other than the prefix.** A `.deb` or a flatpak puts the command in `/usr/bin`, and the prefix being empty is then the intended state rather than a missing install. Declare it in `TOOLING_ELSEWHERE` and it reads `elsewhere` instead of `uninstalled`, `check` stays quiet, and `install` leaves it alone rather than putting a second copy on `PATH` ahead of the real one.
 - **The declaration names a path and that path is checked.** A tool declared as living somewhere it isn't reads `elsewhere-gone`, because a declaration nothing verifies is a way to silence a tool that really has disappeared.
 - **A copy turning up in the prefix anyway is still reported normally.** Two installs racing each other on `PATH` is what this tool exists to notice, and a declaration doesn't get to hide one.
@@ -20,6 +21,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- **A name that is no tracked tool ends the command with exit 2.** `status`, `check`, `install`, `adopt`, `lock`, `unlock` and `record` used to print `no such tool repository` and carry on with an empty list, so `check wrong-name` exited 0 having checked nothing, and `install good wrong-name` installed the good one. A gate that passed the name of a worktree's folder never ran its check. Nothing is done now for any name when one of them is wrong.
 - **`make install` works on a machine with no repository list yet.** It used to install the command and then fail its own check, because there was nothing to track. It now prints where to write the list and exits 0.
 
 ## [1.1.0]
