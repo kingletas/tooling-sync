@@ -13,6 +13,12 @@
 #   tooling-sync record  [TOOL...]      accept the current state as the baseline
 #   tooling-sync tools                  the repositories being tracked
 #
+# TOOL is a tracked repository's name. It may also be a directory: `.`, or
+# anything with a slash in it, names the tool whose repository that directory
+# is inside, whether it is the repository itself or a worktree of it. A name
+# or a directory that is no tracked tool ends the command with exit 2, and
+# nothing is done for the names beside it.
+#
 # Flags:
 #   -n   dry run: say what would be copied, copy nothing
 #   -y   do not prompt (adopt and install are otherwise interactive)
@@ -133,8 +139,8 @@ hash_of() { [[ -f "$1" ]] && sha256sum "$1" 2>/dev/null | cut -d' ' -f1 || echo 
 
 # WHICH REPOSITORIES ARE TOOLS IS DECLARED, NOT INFERRED FROM WHERE THEY SIT.
 # TOOLING_REPOS names a file holding one repository path per line; the tool's
-# name is the basename. $HOME is expanded, so the file reads the same as
-# contract-gate.d/repos and can be edited the same way.
+# name is the basename. $HOME is expanded, # starts a comment and blank lines
+# are skipped, so the file can be written by hand.
 #
 # Membership is never inferred from a shared parent directory: that would stage
 # any project filed there as a tool, and staging breaks an app that installs a
@@ -185,12 +191,39 @@ tool_repo() {
   return 0
 }
 
-resolve_tools() {
-  if [[ $# -eq 0 ]]; then all_tools; return; fi
-  local t
+# The name of the tracked tool whose repository DIR is inside, or nothing. DIR
+# may be the repository itself, a folder in it, or a worktree of it: all of
+# them share one .git, and the repository is the folder that holds it.
+tool_at() {
+  local common main name path
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  main="$(cd -- "$(dirname -- "$common")" 2>/dev/null && pwd -P)" || return 0
+  while IFS=$'\t' read -r name path; do
+    [[ "$(cd -- "$path" 2>/dev/null && pwd -P)" == "$main" ]] && { printf '%s' "$name"; return 0; }
+  done < <(tools_table)
+  return 0
+}
+
+# Sets TOOLS to the tools a command was given, each one checked, or to every
+# tracked tool when it was given none. `.` or anything with a slash in it is a
+# directory, and names the tool whose repository it is inside.
+#
+# This is called in the command's own shell and never inside $(...) or <(...).
+# A refusal raised in one of those ends only that child, and the command
+# would carry on with an empty list and exit 0.
+TOOLS=()
+pick_tools() {
+  TOOLS=()
+  if [[ $# -eq 0 ]]; then mapfile -t TOOLS < <(all_tools); return 0; fi
+  local t name
   for t in "$@"; do
-    [[ -d "$(tool_repo "$t")" ]] || die "no such tool repository: $t (looked in $(source_of_truth))"
-    printf '%s\n' "$t"
+    if [[ "$t" == . || "$t" == */* ]]; then
+      name="$(tool_at "$t")"
+      [[ -n "$name" ]] || die "not inside a tracked tool repository: $t (looked in $(source_of_truth))"
+      t="$name"
+    fi
+    [[ -n "$t" && -d "$(tool_repo "$t")" ]] || die "no such tool repository: $t (looked in $(source_of_truth))"
+    TOOLS+=("$t")
   done
 }
 
@@ -436,9 +469,9 @@ cmd_tools() {
 }
 
 cmd_status() {
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t rel st hint drift=0 total=0 shown
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     build_expected "$t" || { drift=$((drift + 1)); continue; }
     shown=0
     while read -r rel; do
@@ -478,11 +511,11 @@ loses_work() {
 }
 
 cmd_check() {
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t rel st risky=0 stale=0 shadowed=0
   C_OK=''; C_WARN=''; C_BAD=''; C_DIM=''; C_OFF=''
   local -a risky_lines=() stale_lines=() shadowed_lines=()
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     build_expected "$t" || { risky=$((risky + 1)); risky_lines+=("$t: cannot determine what it installs"); continue; }
     while read -r rel; do
       st="$(state_of "$t" "$rel")"
@@ -529,7 +562,7 @@ cmd_check() {
 cmd_diff() {
   local tool="${1:-}" only="${2:-}"
   [[ -n "$tool" ]] || die "diff needs a tool name"
-  resolve_tools "$tool" >/dev/null || exit 2
+  pick_tools "$tool"; tool="${TOOLS[0]}"
   build_expected "$tool" || exit 1
   local rel st
   while read -r rel; do
@@ -552,9 +585,9 @@ confirm() {
 }
 
 cmd_install() {
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t repo failed=0 where
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     # A tool declared as living elsewhere is not installed into the prefix.
     # Doing it anyway would put a second copy on PATH ahead of the real one and
     # recreate exactly the shadowing the declaration exists to record.
@@ -606,9 +639,9 @@ cmd_install() {
 }
 
 cmd_adopt() {
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t rel st src copied=0 stuck=0
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     build_expected "$t" || { stuck=$((stuck + 1)); continue; }
     while read -r rel; do
       st="$(state_of "$t" "$rel")"
@@ -647,9 +680,9 @@ cmd_adopt() {
 
 cmd_lock() {
   local want="$1"; shift
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     build_expected "$t" || continue
     if [[ $DRY -eq 1 ]]; then printf 'would %s %s\n' "$want" "$t"
     else printf '%-18s %s file(s) %sed\n' "$t" "$(set_lock "$t" "$want")" "$want"; fi
@@ -660,9 +693,9 @@ cmd_lock() {
 }
 
 cmd_record() {
-  local -a tools; mapfile -t tools < <(resolve_tools "$@") || exit 2
+  pick_tools "$@"
   local t
-  for t in "${tools[@]}"; do
+  for t in "${TOOLS[@]}"; do
     build_expected "$t" || continue
     if [[ $DRY -eq 1 ]]; then printf 'would record baseline for %s\n' "$t"
     else write_baseline "$t"; printf 'recorded %s (%s)\n' "$t" "$(baseline_file "$t")"; fi

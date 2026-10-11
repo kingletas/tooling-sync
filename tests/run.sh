@@ -100,7 +100,7 @@ check "and it is still named"                        \
   "$(printf '%s' "$out" | grep -c 'moved-away')" "1"
 
 # Comments and blank lines are skipped, and $HOME is expanded, so the file
-# reads the same as contract-gate.d/repos.
+# can be written by hand.
 printf '# a comment\n\n%s\n' "$TOOLING_ROOT/alpha" > "$REPOS"
 listed="$(TOOLING_REPOS="$REPOS" "$SYNC" tools | awk 'NR>1 && NF {print $1}' | grep -vE '^(prefix:|listed)$' | tr '\n' ' ')"
 check "comments and blank lines are skipped"       "$listed" "alpha "
@@ -281,6 +281,61 @@ check "a payload file under an elsewhere tool is not called shadowing" \
 rm -rf "$PREFIX/alpha.d"
 
 rm -f "$TOOLING_ELSEWHERE" "$PREFIX/alpha"
+
+# --- a name that is no tool, and a tool named by where you stand -------------
+
+# A name nobody tracks ends the command. It used to be said and then passed:
+# the refusal was raised inside a process substitution, which ended only that
+# child, and the command went on with an empty list and exit 0. A gate that
+# calls `check NAME` with the wrong name was a gate that never looked.
+make_tool gamma
+"$SYNC" install gamma >/dev/null 2>&1
+for verb in status check install adopt lock unlock record; do
+  out="$("$SYNC" -y "$verb" no-such-tool 2>&1)"; code=$?
+  check "$verb with a name nobody tracks exits 2" "$code" "2"
+  check "and says which name" "$(grep -c 'no such tool repository: no-such-tool' <<< "$out")" "1"
+done
+"$SYNC" diff no-such-tool >/dev/null 2>&1
+check "diff with a name nobody tracks exits 2" "$?" "2"
+"$SYNC" check "" >/dev/null 2>&1
+check "an empty name is no tool either" "$?" "2"
+
+# One bad name stops the whole command, so nothing is done for the good one.
+printf '#!/usr/bin/env bash\necho gamma v2\n' > "$TOOLING_ROOT/gamma/bin/gamma"
+check "the source moved, so gamma is waiting to be installed" "$(state_for gamma gamma)" "repo-ahead"
+"$SYNC" -y install gamma no-such-tool >/dev/null 2>&1
+check "install with one good name and one bad exits 2" "$?" "2"
+check "and installs nothing for the good one" "$(state_for gamma gamma)" "repo-ahead"
+"$SYNC" -y install gamma >/dev/null 2>&1
+
+# A directory names the tool whose repository it is inside. A gate runs in
+# whichever checkout the commit is made from, and a worktree's folder is not
+# named after the tool.
+git -C "$TOOLING_ROOT/gamma" init -q
+git -C "$TOOLING_ROOT/gamma" -c user.name=Test -c user.email=t@example.com add -A
+git -C "$TOOLING_ROOT/gamma" -c user.name=Test -c user.email=t@example.com commit -qm fixture
+git -C "$TOOLING_ROOT/gamma" worktree add -q "$ROOT/elsewhere-worktree" -b side
+"$SYNC" check "$TOOLING_ROOT/gamma" >/dev/null 2>&1
+check "a clean tool named by its repository's path passes" "$?" "0"
+(cd "$ROOT/elsewhere-worktree" && "$SYNC" check . >/dev/null 2>&1)
+check "and named as . from a worktree of it" "$?" "0"
+edit_prefix "$PREFIX/gamma" "edited where it runs"
+out="$(cd "$ROOT/elsewhere-worktree" && "$SYNC" check . 2>&1)"; code=$?
+check "from a worktree, . runs the check: an edit in the prefix fails it" "$code" "1"
+check "and it is gamma the check names" "$(grep -c 'bin-ahead *gamma/gamma' <<< "$out")" "1"
+(cd "$TOOLING_ROOT/gamma/bin" && "$SYNC" check . >/dev/null 2>&1)
+check "a folder inside the repository names it too" "$?" "1"
+check "status takes a directory as well" "$(cd "$ROOT/elsewhere-worktree" && "$SYNC" status . 2>&1 | awk '$2 == "gamma" {print $1}')" "bin-ahead"
+
+mkdir -p "$ROOT/not-a-repository"
+out="$("$SYNC" check "$ROOT/not-a-repository" 2>&1)"; code=$?
+check "a directory in no repository exits 2" "$code" "2"
+check "and says it is not inside a tracked tool" "$(grep -c 'not inside a tracked tool repository' <<< "$out")" "1"
+git -C "$ROOT/not-a-repository" init -q
+"$SYNC" check "$ROOT/not-a-repository" >/dev/null 2>&1
+check "a repository nobody tracks exits 2" "$?" "2"
+"$SYNC" check "$ROOT/no/such/path" >/dev/null 2>&1
+check "a path that does not exist exits 2" "$?" "2"
 
 echo
 printf '  %d passed, %d failed\n\n' "$pass" "$fail"
