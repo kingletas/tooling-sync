@@ -275,6 +275,11 @@ check "declared and present reads elsewhere" "$(state_for alpha alpha)" "elsewhe
 
 "$SYNC" check >/dev/null 2>&1
 check "check does not block on a tool that lives elsewhere" "$?" "0"
+# status agrees with check: a declared install elsewhere is in step, not drift.
+out="$("$SYNC" status alpha 2>&1)"; status=$?
+check "status counts a tool that lives elsewhere as in step" "$status" "0"
+case "$out" in *' 0 out of step'*) ok "and its total says 0 out of step" ;;
+               *) bad "and its total says 0 out of step" "$out" ;; esac
 
 "$SYNC" install alpha >/dev/null 2>&1
 check "install leaves the prefix alone for it" \
@@ -284,6 +289,8 @@ check "install leaves the prefix alone for it" \
 # silence a tool that really has gone.
 rm -f "$real"
 check "declared and NOT there reads elsewhere-gone" "$(state_for alpha alpha)" "elsewhere-gone"
+"$SYNC" status alpha >/dev/null 2>&1
+check "and status counts that one as out of step" "$?" "1"
 
 # And a copy turning up in the prefix anyway is still reported, because two
 # installs racing each other on PATH is the thing this tool exists to notice.
