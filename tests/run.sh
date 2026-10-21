@@ -207,6 +207,29 @@ else
 fi
 "$SYNC" install alpha >/dev/null 2>&1
 
+# --- a copy left writable is unlocked, and check fails until it is locked ----
+
+# A plain `make install` copies without locking, and the copy still matches the
+# repository, so by content alone it reads as in step. The lock is what makes
+# an in-place edit fail at the keystroke, so a copy without it is reported.
+make -C "$TOOLING_ROOT/alpha" install PREFIX="$PREFIX" >/dev/null 2>&1
+check "a direct make install reads unlocked"      "$(state_for alpha alpha)" "unlocked"
+out="$("$SYNC" check alpha 2>&1)"; status=$?
+check "and check fails on it"                      "$status" "1"
+case "$out" in *'tooling-sync lock'*) ok "and says to lock it" ;;
+               *) bad "and says to lock it" "$out" ;; esac
+check "diff has nothing to show for it" "$("$SYNC" diff alpha 2>&1 | grep -c unlocked)" "0"
+"$SYNC" lock alpha >/dev/null 2>&1
+check "lock puts it back in step"                  "$(state_for alpha alpha)" ""
+"$SYNC" check alpha >/dev/null 2>&1
+check "and check passes again"                     "$?" "0"
+"$SYNC" unlock alpha >/dev/null 2>&1
+check "unlock for an experiment reads unlocked too" "$(state_for alpha alpha)" "unlocked"
+TOOLING_LOCK=0 "$SYNC" check alpha >/dev/null 2>&1
+check "with TOOLING_LOCK=0 a writable copy is not reported" "$?" "0"
+"$SYNC" install alpha >/dev/null 2>&1
+check "install locks it again"                     "$(state_for alpha alpha)" ""
+
 # Declared-local files are hand-edited on purpose and must not be locked.
 "$SYNC" install beta >/dev/null 2>&1
 if ( printf 'setting = edited\n' > "$PREFIX/beta.d/config.tsv" ) 2>/dev/null; then
@@ -214,6 +237,8 @@ if ( printf 'setting = edited\n' > "$PREFIX/beta.d/config.tsv" ) 2>/dev/null; th
 else
   bad "a declared-local file is left writable" "it was locked"
 fi
+check "and a writable declared-local file reads local, not unlocked" \
+  "$(state_for beta beta.d/config.tsv)" "local"
 printf 'setting = local\n' > "$PREFIX/beta.d/config.tsv"
 
 # --- a declared difference survives its own installer ------------------------
@@ -250,6 +275,11 @@ check "declared and present reads elsewhere" "$(state_for alpha alpha)" "elsewhe
 
 "$SYNC" check >/dev/null 2>&1
 check "check does not block on a tool that lives elsewhere" "$?" "0"
+# status agrees with check: a declared install elsewhere is in step, not drift.
+out="$("$SYNC" status alpha 2>&1)"; status=$?
+check "status counts a tool that lives elsewhere as in step" "$status" "0"
+case "$out" in *' 0 out of step'*) ok "and its total says 0 out of step" ;;
+               *) bad "and its total says 0 out of step" "$out" ;; esac
 
 "$SYNC" install alpha >/dev/null 2>&1
 check "install leaves the prefix alone for it" \
@@ -259,6 +289,8 @@ check "install leaves the prefix alone for it" \
 # silence a tool that really has gone.
 rm -f "$real"
 check "declared and NOT there reads elsewhere-gone" "$(state_for alpha alpha)" "elsewhere-gone"
+"$SYNC" status alpha >/dev/null 2>&1
+check "and status counts that one as out of step" "$?" "1"
 
 # And a copy turning up in the prefix anyway is still reported, because two
 # installs racing each other on PATH is the thing this tool exists to notice.

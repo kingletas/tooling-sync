@@ -65,6 +65,8 @@ Blocking on those would mean the only way to commit a tool change is to install 
 
 `bin-only` is the state no repository-side check can reach: a helper written straight into the payload directory, present in no repository, running on every invocation. One of those had been live for a day when this tool first ran.
 
+**One more state sits beside them: `unlocked`.** A copy that matches the repository but can still be written reads `unlocked`, and `check` fails on it until `tooling-sync lock` or the next `tooling-sync install` makes it read-only again. A plain `make install` copies without locking, and the lock is what makes an edit in the prefix fail at the keystroke, so a copy without it is worth hearing about even though nothing was edited. `tooling-sync unlock` for an experiment reads the same way until it is relocked. With `TOOLING_LOCK=0` nothing is locked on purpose, and nothing reads `unlocked`.
+
 ## Declared differences
 
 Some differences are correct and permanent — an installed config file naming your own paths, against the generic starter the repository ships. Declare them:

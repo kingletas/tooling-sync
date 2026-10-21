@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- **A copy left writable reads `unlocked`, and `check` fails on it.** A plain `make install` copies without locking, and the copy matched the repository, so it read as in step and nothing said the lock was gone. Now `status` lists it with `tooling-sync lock` as the fix, and `check` exits 1 until it is locked again; `diff` has nothing to show for it. A declared-local file is never `unlocked`, and with `TOOLING_LOCK=0` nothing is.
 - **Which repositories are tools is declared rather than inferred from where they sit.** `TOOLING_REPOS` names a file holding one repository path per line, and that file is the authority when it exists. Scanning a parent directory is kept as the fallback for anyone who keeps their tools in one place.
 - **A listed repository that isn't on disk reads `MISSING`.** Skipping it would let the list stop describing anything without saying so.
 - **`TOOLING_ROOT` has no default.** It used to default to a directory on the author's machine. Set it to scan a directory; with neither a list nor `TOOLING_ROOT`, every command exits 2 and names the list it looked for.

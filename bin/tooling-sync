@@ -341,8 +341,12 @@ write_baseline() {
 # configuration, hand-edited on purpose, and locking them would be telling
 # somebody off for the one thing they are supposed to do here.
 #
-# Modes are not compared anywhere -- `state_of` reads content hashes -- so a
-# locked 555 file and a 755 file in a repository are `synced`, which is correct.
+# Modes are not compared with the repository -- `state_of` reads content
+# hashes -- so a locked 555 file and a 755 file in a repository are `synced`.
+# What is checked is whether a managed copy can still be written: a plain
+# `make install` copies without locking, and a copy left writable is `unlocked`
+# until `lock` or the next `install`. With TOOLING_LOCK=0 nothing is locked on
+# purpose, so nothing reads `unlocked` either.
 set_lock() {
   local tool="$1" want="$2" rel path n=0
   while read -r rel; do
@@ -380,6 +384,13 @@ tracked_rels() {
   done
 }
 
+# A managed copy anyone could write, when copies are meant to be locked. The
+# mode is read rather than tried, so a check run as root still sees it.
+writable() {
+  [[ "${TOOLING_LOCK:-1}" != 0 ]] || return 1
+  [[ -n "$(find "$1" -maxdepth 0 -type f -perm /222 2>/dev/null)" ]]
+}
+
 state_of() {
   local tool="$1" rel="$2" eh ih bh where
   if is_local "$tool" "$rel"; then echo local; return; fi
@@ -400,7 +411,10 @@ state_of() {
       [[ -e "$where" ]] && { echo elsewhere; return; }
       echo elsewhere-gone; return
     fi
-  [[ "$eh" == "$ih" ]] && { echo synced;      return; }
+  if [[ "$eh" == "$ih" ]]; then
+    writable "$PREFIX/$rel" && { echo unlocked; return; }
+    echo synced; return
+  fi
   [[ "$ih" == '-'  ]] && { echo uninstalled;  return; }
   [[ "$eh" == '-'  ]] && { echo bin-only;     return; }
   bh="$(baseline_hash "$tool" "$rel")"
@@ -413,7 +427,7 @@ state_of() {
 state_colour() {
   case "$1" in
     synced|local|elsewhere)      echo "$C_OK" ;;
-    repo-ahead|bin-ahead|uninstalled|bin-only) echo "$C_WARN" ;;
+    repo-ahead|bin-ahead|uninstalled|bin-only|unlocked) echo "$C_WARN" ;;
     *)                           echo "$C_BAD" ;;
   esac
 }
@@ -422,6 +436,7 @@ state_advice() {
   case "$1" in
     repo-ahead)  echo "tooling-sync install — the prefix is behind the source" ;;
     uninstalled) echo "tooling-sync install" ;;
+    unlocked)    echo "tooling-sync lock — installed without the lock; nothing was edited" ;;
     elsewhere)   echo "" ;;
     elsewhere-gone) echo "declared as installed elsewhere, and it is not there" ;;
       shadowing)   echo "a copy in the prefix is shadowing the declared install — remove it" ;;
@@ -482,7 +497,7 @@ cmd_status() {
       if [[ "$st" == local ]]; then hint="$(local_reason "$t" "$rel")"; else hint="$(state_advice "$st")"; fi
       printf '  %s%-12s%s %-40s %s%s%s\n' \
         "$(state_colour "$st")" "$st" "$C_OFF" "$rel" "$C_DIM" "$hint" "$C_OFF"
-      [[ "$st" == local ]] || drift=$((drift + 1))
+      [[ "$st" == local || "$st" == elsewhere ]] || drift=$((drift + 1))
     done < <(tracked_rels "$t")
     [[ $shown -eq 0 ]] && printf '\n%s\n  %sin step%s\n' "$t" "$C_OK" "$C_OFF"
     rm -rf "$EXPECTED_DIR"; EXPECTED_DIR=''
@@ -512,9 +527,9 @@ loses_work() {
 
 cmd_check() {
   pick_tools "$@"
-  local t rel st risky=0 stale=0 shadowed=0
+  local t rel st risky=0 stale=0 shadowed=0 unlocked=0
   C_OK=''; C_WARN=''; C_BAD=''; C_DIM=''; C_OFF=''
-  local -a risky_lines=() stale_lines=() shadowed_lines=()
+  local -a risky_lines=() stale_lines=() shadowed_lines=() unlocked_lines=()
   for t in "${TOOLS[@]}"; do
     build_expected "$t" || { risky=$((risky + 1)); risky_lines+=("$t: cannot determine what it installs"); continue; }
     while read -r rel; do
@@ -524,6 +539,10 @@ cmd_check() {
       # one thing that must not be offered for it, so it is not `stale` either.
       if [[ "$st" == shadowing ]]; then
         shadowed=$((shadowed + 1)); shadowed_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
+      # Unlocked loses no work either, but it is the state the lock exists to
+      # prevent, so it fails until the copy is locked again.
+      elif [[ "$st" == unlocked ]]; then
+        unlocked=$((unlocked + 1)); unlocked_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
       elif loses_work "$st"; then
         risky=$((risky + 1)); risky_lines+=("$(printf '  %-12s %s/%s' "$st" "$t" "$rel")")
       else
@@ -546,6 +565,12 @@ cmd_check() {
       printf 'Remove the prefix copy. Do not run "tooling-sync install": it is what\n'
       printf 'puts the copy there.\n\n'
     fi
+  if [[ $unlocked -gt 0 ]]; then
+    printf 'tooling-sync: %d installed file(s) can be written, so an edit in the prefix would not fail.\n' "$unlocked"
+    printf '%s\n' "${unlocked_lines[@]}"
+    printf '\nThey match the repository, so nothing was edited; a plain "make install"\n'
+    printf 'copies without locking. Run "tooling-sync lock" to make them read-only again.\n\n'
+  fi
   if [[ $risky -gt 0 ]]; then
     printf 'tooling-sync: %d file(s) were edited in the prefix rather than in the source.\n' "$risky"
     printf '%s\n' "${risky_lines[@]}"
@@ -556,6 +581,7 @@ cmd_check() {
     return 1
   fi
     [[ $shadowed -gt 0 ]] && return 1
+  [[ $unlocked -gt 0 ]] && return 1
   return 0
 }
 
@@ -568,7 +594,7 @@ cmd_diff() {
   while read -r rel; do
     [[ -n "$only" && "$rel" != *"$only"* ]] && continue
     st="$(state_of "$tool" "$rel")"
-    [[ "$st" == synced ]] && continue
+    [[ "$st" == synced || "$st" == unlocked ]] && continue
     printf '\n=== %s  [%s]\n' "$rel" "$st"
     # Left is the repository, right is what is installed, always in that order.
     diff -u --label "repo:$rel" --label "installed:$rel" \
